@@ -140,6 +140,17 @@ TIMEFRAME_PATTERNS = {
     b'PERIOD_D1': 'D1', b'PERIOD_W1': 'W1', b'PERIOD_MN1': 'MN1',
 }
 
+MIN_STRUCTURED_STRING_LEN = 4
+URL_PATTERN = r'https?://[^\x00\s\'"]{4,}'
+WWW_PATTERN = r'www\.[^\x00\s\'"]{4,}'
+COPYRIGHT_MAX_LEN = 120
+DESCRIPTION_MIN_LEN = 12
+DESCRIPTION_MAX_LEN = 100
+HIGH_ENTROPY_THRESHOLD = 7.2
+LOW_SEMANTIC_RATIO_THRESHOLD = 0.08
+HIGH_OBFUSCATION_SCORE = 5
+MEDIUM_OBFUSCATION_SCORE = 3
+
 AUDIT_KEYWORDS = {
     'credential_access': [
         'AccountPassword', 'Password',
@@ -154,7 +165,7 @@ AUDIT_KEYWORDS = {
     'account_locking': [
         'AccountNumber', 'AccountServer', 'AccountCompany',
     ],
-    'account_fingerprinting': [
+    'account_queries': [
         'AccountBalance', 'AccountEquity', 'AccountName',
         'AccountCurrency', 'AccountLeverage',
     ],
@@ -463,7 +474,8 @@ class EX4AnalysisEngine:
 
         def add(value: str, source: str):
             value = value.strip()
-            if len(value) >= 4:
+            # Filter out tiny fragments that are usually binary noise.
+            if len(value) >= MIN_STRUCTURED_STRING_LEN:
                 structured.append({'value': value, 'source': source})
 
         for field in ['copyright', 'description', 'author', 'link']:
@@ -475,16 +487,22 @@ class EX4AnalysisEngine:
             add(param['name'], 'parameter_table')
 
         blob = data.decode('latin1', errors='ignore')
-        for match in re.finditer(r'https?://[^\x00\s\'"]{4,}', blob, re.IGNORECASE):
+        for match in re.finditer(URL_PATTERN, blob, re.IGNORECASE):
             add(match.group(0), 'embedded_link')
 
-        for match in re.finditer(r'www\.[^\x00\s\'"]{4,}', blob, re.IGNORECASE):
+        for match in re.finditer(WWW_PATTERN, blob, re.IGNORECASE):
             add(match.group(0), 'embedded_link')
 
-        for match in re.finditer(r'copyright[^\x00\r\n]{0,120}', blob, re.IGNORECASE):
+        # Keep copyright-style strings bounded to avoid swallowing large blobs.
+        for match in re.finditer(
+                rf'copyright[^\x00\r\n]{{0,{COPYRIGHT_MAX_LEN}}}',
+                blob, re.IGNORECASE):
             add(match.group(0), 'metadata_regex')
 
-        for match in re.finditer(r'\(c\)[^\x00\r\n]{4,120}', blob, re.IGNORECASE):
+        for match in re.finditer(
+                rf'\(c\)[^\x00\r\n]{{{MIN_STRUCTURED_STRING_LEN},'
+                rf'{COPYRIGHT_MAX_LEN}}}',
+                blob, re.IGNORECASE):
             add(match.group(0), 'metadata_regex')
 
         return structured
@@ -530,7 +548,8 @@ class EX4AnalysisEngine:
                 enriched['author'] = value.strip()
 
             if enriched.get('description') == 'Unknown':
-                if 12 <= len(value) <= 100 and 'indicator' in lower_value:
+                if (DESCRIPTION_MIN_LEN <= len(value) <= DESCRIPTION_MAX_LEN
+                        and 'indicator' in lower_value):
                     enriched['description'] = value.strip()
 
         return enriched
@@ -866,7 +885,7 @@ class EX4AnalysisEngine:
             'network_io': 'medium',
             'dll_usage': 'medium',
             'account_locking': 'medium',
-            'account_fingerprinting': 'medium',
+            'account_queries': 'medium',
             'backtest_detection': 'medium',
             'time_gating': 'low',
         }
@@ -875,7 +894,7 @@ class EX4AnalysisEngine:
             'network_io': 'Network or remote communication hooks',
             'dll_usage': 'DLL or native import usage',
             'account_locking': 'Account or broker locking hooks',
-            'account_fingerprinting': 'Account fingerprinting hooks',
+            'account_queries': 'Account inspection hooks',
             'backtest_detection': 'Backtest or tester detection',
             'time_gating': 'Time-based logic gates',
         }
@@ -992,18 +1011,21 @@ class EX4AnalysisEngine:
         score = 0
         if meta.get('format', '').startswith('Modern'):
             score += 2
-        if stats.get('entropy', 0) >= 7.2:
+        # Entropy at or above ~7.2 usually indicates compressed/encrypted payloads.
+        if stats.get('entropy', 0) >= HIGH_ENTROPY_THRESHOLD:
             score += 2
-        if semantic_ratio < 0.08:
+        # Very few meaningful strings usually means aggressive obfuscation.
+        if semantic_ratio < LOW_SEMANTIC_RATIO_THRESHOLD:
             score += 1
         if structured_count == 0:
             score += 1
         if not analysis.get('patterns'):
             score += 1
 
-        if score >= 5:
+        # Score buckets: 0-2 low, 3-4 medium, 5+ high.
+        if score >= HIGH_OBFUSCATION_SCORE:
             obfuscation = 'High'
-        elif score >= 3:
+        elif score >= MEDIUM_OBFUSCATION_SCORE:
             obfuscation = 'Medium'
         else:
             obfuscation = 'Low'
@@ -1024,7 +1046,8 @@ class EX4AnalysisEngine:
         ]
         if meta.get('format', '').startswith('Modern'):
             notes.append(
-                'Modern encrypted EX4 payloads preserve little high-confidence logic without opcode-level decoding.')
+                'Modern encrypted EX4 payloads preserve little high-confidence '
+                'logic without opcode-level decoding.')
 
         return {
             'recovery_level': recovery,
