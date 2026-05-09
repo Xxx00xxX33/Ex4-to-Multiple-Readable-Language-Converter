@@ -143,7 +143,7 @@ TIMEFRAME_PATTERNS = {
 MIN_STRUCTURED_STRING_LEN = 4
 URL_PATTERN = r'https?://[^\x00\s\'"]{4,}'
 WWW_PATTERN = r'www\.[^\x00\s\'"]{4,}'
-COPYRIGHT_MAX_LEN = 120
+METADATA_STRING_MAX_LEN = 120
 DESCRIPTION_MIN_LEN = 12
 DESCRIPTION_MAX_LEN = 100
 HIGH_ENTROPY_THRESHOLD = 7.2
@@ -495,20 +495,20 @@ class EX4AnalysisEngine:
 
         # Keep copyright-style strings bounded to avoid swallowing large blobs.
         for match in re.finditer(
-                rf'copyright[^\x00\r\n]{{0,{COPYRIGHT_MAX_LEN}}}',
+                rf'copyright[^\x00\r\n]{{0,{METADATA_STRING_MAX_LEN}}}',
                 blob, re.IGNORECASE):
             add(match.group(0), 'metadata_regex')
 
         for match in re.finditer(
                 rf'\(c\)[^\x00\r\n]{{{MIN_STRUCTURED_STRING_LEN},'
-                rf'{COPYRIGHT_MAX_LEN}}}',
+                rf'{METADATA_STRING_MAX_LEN}}}',
                 blob, re.IGNORECASE):
             add(match.group(0), 'metadata_regex')
 
         return structured
 
     def _merge_string_sources(self, structured_strings: List[Dict],
-                              fallback_strings: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
+                              extracted_strings: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
         ordered: List[str] = []
         seen = set()
         sources: Dict[str, List[str]] = defaultdict(list)
@@ -521,7 +521,7 @@ class EX4AnalysisEngine:
             if value not in sources[item['source']]:
                 sources[item['source']].append(value)
 
-        for value in fallback_strings:
+        for value in extracted_strings:
             if value not in seen:
                 ordered.append(value)
                 seen.add(value)
@@ -1011,7 +1011,8 @@ class EX4AnalysisEngine:
         score = 0
         if meta.get('format', '').startswith('Modern'):
             score += 2
-        # Entropy at or above ~7.2 usually indicates compressed/encrypted payloads.
+        # Entropy at or above HIGH_ENTROPY_THRESHOLD usually indicates
+        # compressed/encrypted payloads.
         if stats.get('entropy', 0) >= HIGH_ENTROPY_THRESHOLD:
             score += 2
         # Very few meaningful strings usually means aggressive obfuscation.
@@ -1022,7 +1023,8 @@ class EX4AnalysisEngine:
         if not analysis.get('patterns'):
             score += 1
 
-        # Score buckets: 0-2 low, 3-4 medium, 5+ high.
+        # Score buckets use MEDIUM_OBFUSCATION_SCORE and
+        # HIGH_OBFUSCATION_SCORE as the classification thresholds.
         if score >= HIGH_OBFUSCATION_SCORE:
             obfuscation = 'High'
         elif score >= MEDIUM_OBFUSCATION_SCORE:
@@ -1086,6 +1088,14 @@ class CodeGenerator:
         return [border, inner, border]
 
     @staticmethod
+    def _recovery_note_lines(comment_prefix: str) -> List[str]:
+        prefix = f"{comment_prefix} " if comment_prefix else ""
+        return [
+            f"{prefix}declarations are inferred from preserved EX4 data.",
+            f"{prefix}reconstructed logic is lower confidence.",
+        ]
+
+    @staticmethod
     def _safe_class_name(analysis: Dict, fallback: str = 'EX4Program') -> str:
         name = os.path.splitext(os.path.basename(
             analysis.get('filepath', fallback)))[0]
@@ -1110,8 +1120,7 @@ class CodeGenerator:
         if meta.get('copyright', 'Unknown') != 'Unknown':
             L.append(f"// Copyright: {meta['copyright']}")
         L.append(f"// Recovery:  {recovery.get('recovery_level', 'Unknown')}")
-        L.append("// Note: declarations are inferred from preserved EX4 data.")
-        L.append("// Note: function bodies below are reconstruction templates.")
+        L += self._recovery_note_lines("// Note:")
         L.append('')
 
         strat = a.get('trading_strategy', {})
@@ -1209,8 +1218,7 @@ class CodeGenerator:
         L += self._header_box(f"Decompiled MQL5 – {meta['type']}")
         L.append(f"// Version: {meta['version']}")
         L.append(f"// Recovery: {recovery.get('recovery_level', 'Unknown')}")
-        L.append("// Note: preserved metadata/parameters are higher confidence.")
-        L.append("// Note: reconstructed logic below is lower confidence.")
+        L += self._recovery_note_lines("// Note:")
         L.append('')
         L.append('#include <Trade/Trade.mqh>')
         L.append('#include <Indicators/Indicators.mqh>')
@@ -1291,8 +1299,7 @@ class CodeGenerator:
         L.append(f"Converted from MT4 {meta['type']}")
         L.append(f"Version: {meta['version']}")
         L.append(f"Recovery: {recovery.get('recovery_level', 'Unknown')}")
-        L.append("Recovered declarations come from preserved EX4 metadata/strings.")
-        L.append("Method bodies remain reconstructed templates.")
+        L += self._recovery_note_lines("")
         strat = a.get('trading_strategy', {})
         if strat.get('type', 'Unknown') != 'Unknown':
             L.append(f"Strategy: {strat['type']}")
@@ -1383,8 +1390,8 @@ class CodeGenerator:
         L.append(f'/* Converted from MT4 {meta["type"]} */')
         L.append(f'/* Version: {meta["version"]} */')
         L.append(f'/* Recovery: {recovery.get("recovery_level", "Unknown")} */')
-        L.append('/* Recovered declarations are higher confidence. */')
-        L.append('/* Reconstructed body logic is lower confidence. */')
+        L += ['/* declarations are inferred from preserved EX4 data. */',
+              '/* reconstructed body logic is lower confidence. */']
         L.append('')
         L.append('#include <stdio.h>')
         L.append('#include <stdlib.h>')
@@ -1445,8 +1452,7 @@ class CodeGenerator:
         L.append(f'# Converted from MT4 {meta["type"]}')
         L.append(f'# Version: {meta["version"]}')
         L.append(f'# Recovery: {recovery.get("recovery_level", "Unknown")}')
-        L.append('# Declarations are inferred from preserved EX4 data.')
-        L.append('# Execution flow remains reconstructed.')
+        L += self._recovery_note_lines("#")
         L.append('')
         L.append('library(quantmod)')
         L.append('library(TTR)')
