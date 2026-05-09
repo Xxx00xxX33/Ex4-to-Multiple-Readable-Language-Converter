@@ -1110,7 +1110,7 @@ class CodeGenerator:
         L = []
         meta = a['metadata']
         recovery = a.get('recovery_profile', {})
-        L += self._header_box(f"Decompiled MQL4 \u2013 {meta['type']}")
+        L += self._header_box(f"Reconstructed MQL4 Template \u2013 {meta['type']}")
         L.append(f"// Version:   {meta['version']}")
         L.append(f"// Format:    {meta.get('format', 'Unknown')}")
         if meta.get('build', 0) > 0:
@@ -1215,7 +1215,7 @@ class CodeGenerator:
         meta = a['metadata']
         cn = self._safe_class_name(a)
         recovery = a.get('recovery_profile', {})
-        L += self._header_box(f"Decompiled MQL5 – {meta['type']}")
+        L += self._header_box(f"Reconstructed MQL5 Template – {meta['type']}")
         L.append(f"// Version: {meta['version']}")
         L.append(f"// Recovery: {recovery.get('recovery_level', 'Unknown')}")
         L += self._recovery_note_lines("// Note:")
