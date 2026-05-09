@@ -481,7 +481,7 @@ class EX4AnalysisEngine:
         for match in re.finditer(r'www\.[^\x00\s\'"]{4,}', blob, re.IGNORECASE):
             add(match.group(0), 'embedded_link')
 
-        for match in re.finditer(r'copyright[^\x00\r\n]{4,120}', blob, re.IGNORECASE):
+        for match in re.finditer(r'copyright[^\x00\r\n]{0,120}', blob, re.IGNORECASE):
             add(match.group(0), 'metadata_regex')
 
         for match in re.finditer(r'\(c\)[^\x00\r\n]{4,120}', blob, re.IGNORECASE):
@@ -523,7 +523,7 @@ class EX4AnalysisEngine:
                     enriched['link'] = value.strip()
 
             if enriched.get('copyright') == 'Unknown':
-                if 'copyright' in lower_value or value.startswith('(c)'):
+                if 'copyright' in lower_value or lower_value.startswith('(c)'):
                     enriched['copyright'] = value.strip()
 
             if enriched.get('author') == 'Unknown' and ' by ' in lower_value:
@@ -985,8 +985,9 @@ class EX4AnalysisEngine:
             for name in ['functions', 'indicators', 'parameters',
                          'links', 'metadata', 'security']
         )
+        total_strings = max(len(strings), 1)
         semantic_ratio = round(
-            meaningful_count / len(strings), 4) if strings else 0.0
+            meaningful_count / total_strings, 4) if strings else 0.0
 
         score = 0
         if meta.get('format', '').startswith('Modern'):
