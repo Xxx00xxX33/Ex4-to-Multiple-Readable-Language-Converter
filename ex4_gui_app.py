@@ -525,8 +525,8 @@ class EX4AnalysisEngine:
             if value not in seen:
                 ordered.append(value)
                 seen.add(value)
-            if value not in sources['fallback_scan']:
-                sources['fallback_scan'].append(value)
+                if value not in sources['fallback_scan']:
+                    sources['fallback_scan'].append(value)
 
         return ordered, dict(sources)
 
