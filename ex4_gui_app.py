@@ -140,6 +140,33 @@ TIMEFRAME_PATTERNS = {
     b'PERIOD_D1': 'D1', b'PERIOD_W1': 'W1', b'PERIOD_MN1': 'MN1',
 }
 
+AUDIT_KEYWORDS = {
+    'credential_access': [
+        'AccountPassword', 'Password',
+    ],
+    'network_io': [
+        'WebRequest', 'SendMail', 'URLDownloadToFile',
+        'InternetOpen', 'Wininet', 'Socket',
+    ],
+    'dll_usage': [
+        '#import', 'LoadLibrary', 'GetProcAddress',
+    ],
+    'account_locking': [
+        'AccountNumber', 'AccountServer', 'AccountCompany',
+    ],
+    'account_fingerprinting': [
+        'AccountBalance', 'AccountEquity', 'AccountName',
+        'AccountCurrency', 'AccountLeverage',
+    ],
+    'backtest_detection': [
+        'IsTesting', 'TesterStatistics', 'MQL_TESTER',
+    ],
+    'time_gating': [
+        'TimeCurrent', 'TimeLocal', 'TimeGMT', 'Hour',
+        'DayOfWeek', 'TimeDayOfWeek', 'Expiration',
+    ],
+}
+
 PARAM_TYPE_HINTS = {
     'period': ('int', 14), 'shift': ('int', 0), 'lot': ('double', 0.1),
     'lots': ('double', 0.1), 'stoploss': ('int', 50), 'sl': ('int', 50),
@@ -179,10 +206,14 @@ class EX4AnalysisEngine:
             raise ValueError("File too small to be a valid EX4 file")
 
         metadata = self._extract_metadata(data)
-        strings = self._extract_strings(data)
 
         # For old format, also extract parameter names from sections
         ex4_params = self._parse_ex4_parameters(data, metadata)
+        structured_strings = self._extract_structured_strings(
+            data, metadata, ex4_params)
+        strings, string_sources = self._merge_string_sources(
+            structured_strings, self._extract_strings(data))
+        metadata = self._enrich_metadata_from_strings(metadata, strings)
 
         categories = self._categorize_strings(strings)
 
@@ -241,6 +272,7 @@ class EX4AnalysisEngine:
             'pe_info': self._parse_pe_header(data),
             'patterns': patterns,
             'strings': strings,
+            'string_sources': string_sources,
             'string_categories': categories,
             'event_handlers': handlers,
             'trading_functions': trading_funcs,
@@ -248,10 +280,12 @@ class EX4AnalysisEngine:
             'buffer_functions': self._find_buffer_functions(data),
             'input_parameters': input_params,
             'trading_strategy': self._analyze_strategy(data),
-            'risk_management': self._analyze_risk(data),
+            'risk_management': self._analyze_risk(data, strings),
+            'audit_report': self._audit_binary(data, strings),
             'disassembly': self._disassemble(data),
-            'statistics': self._statistics(data, strings),
+            'statistics': self._statistics(data, strings, string_sources),
         }
+        result['recovery_profile'] = self._build_recovery_profile(result)
         logger.info("Analysis complete – %d patterns, %d strings",
                      len(result['patterns']), len(strings))
         return result
@@ -423,6 +457,84 @@ class EX4AnalysisEngine:
 
         return params
 
+    def _extract_structured_strings(self, data: bytes, metadata: Dict,
+                                    params: List[Dict]) -> List[Dict]:
+        structured: List[Dict] = []
+
+        def add(value: str, source: str):
+            value = value.strip()
+            if len(value) >= 4:
+                structured.append({'value': value, 'source': source})
+
+        for field in ['copyright', 'description', 'author', 'link']:
+            value = metadata.get(field, 'Unknown')
+            if isinstance(value, str) and value != 'Unknown':
+                add(value, 'metadata_header')
+
+        for param in params:
+            add(param['name'], 'parameter_table')
+
+        blob = data.decode('latin1', errors='ignore')
+        for match in re.finditer(r'https?://[^\x00\s\'"]{4,}', blob, re.IGNORECASE):
+            add(match.group(0), 'embedded_link')
+
+        for match in re.finditer(r'www\.[^\x00\s\'"]{4,}', blob, re.IGNORECASE):
+            add(match.group(0), 'embedded_link')
+
+        for match in re.finditer(r'copyright[^\x00\r\n]{4,120}', blob, re.IGNORECASE):
+            add(match.group(0), 'metadata_regex')
+
+        for match in re.finditer(r'\(c\)[^\x00\r\n]{4,120}', blob, re.IGNORECASE):
+            add(match.group(0), 'metadata_regex')
+
+        return structured
+
+    def _merge_string_sources(self, structured_strings: List[Dict],
+                              fallback_strings: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
+        ordered: List[str] = []
+        seen = set()
+        sources: Dict[str, List[str]] = defaultdict(list)
+
+        for item in structured_strings:
+            value = item['value']
+            if value not in seen:
+                ordered.append(value)
+                seen.add(value)
+            if value not in sources[item['source']]:
+                sources[item['source']].append(value)
+
+        for value in fallback_strings:
+            if value not in seen:
+                ordered.append(value)
+                seen.add(value)
+            if value not in sources['fallback_scan']:
+                sources['fallback_scan'].append(value)
+
+        return ordered, dict(sources)
+
+    def _enrich_metadata_from_strings(self, metadata: Dict,
+                                      strings: List[str]) -> Dict:
+        enriched = dict(metadata)
+
+        for value in strings:
+            lower_value = value.lower()
+            if enriched.get('link') == 'Unknown':
+                if re.search(r'https?://|www\.|t\.me/', value, re.IGNORECASE):
+                    enriched['link'] = value.strip()
+
+            if enriched.get('copyright') == 'Unknown':
+                if 'copyright' in lower_value or value.startswith('(c)'):
+                    enriched['copyright'] = value.strip()
+
+            if enriched.get('author') == 'Unknown' and ' by ' in lower_value:
+                enriched['author'] = value.strip()
+
+            if enriched.get('description') == 'Unknown':
+                if 12 <= len(value) <= 100 and 'indicator' in lower_value:
+                    enriched['description'] = value.strip()
+
+        return enriched
+
     # -- PE header ------------------------------------------------------------
 
     def _parse_pe_header(self, data: bytes) -> Dict:
@@ -534,7 +646,8 @@ class EX4AnalysisEngine:
     def _categorize_strings(self, strings: List[str]) -> Dict[str, List[str]]:
         cats: Dict[str, List[str]] = {
             'functions': [], 'variables': [], 'indicators': [],
-            'symbols': [], 'parameters': [], 'comments': [], 'other': [],
+            'symbols': [], 'parameters': [], 'links': [],
+            'metadata': [], 'security': [], 'comments': [], 'other': [],
         }
         func_kw = [
             'OnInit', 'OnDeinit', 'OnTick', 'OnCalculate', 'OnStart',
@@ -550,6 +663,17 @@ class EX4AnalysisEngine:
         for s in strings:
             sl = s.lower()
             placed = False
+            if re.search(r'https?://|www\.|t\.me/', s, re.IGNORECASE):
+                cats['links'].append(s)
+                continue
+            if any(token in sl for token in ['copyright', '(c)', 'telegram',
+                                             'author', 'description']):
+                cats['metadata'].append(s)
+                continue
+            if any(token.lower() in sl for group in AUDIT_KEYWORDS.values()
+                   for token in group):
+                cats['security'].append(s)
+                continue
             for kw in func_kw:
                 if kw.lower() in sl:
                     cats['functions'].append(s)
@@ -679,15 +803,31 @@ class EX4AnalysisEngine:
 
     # -- risk management ------------------------------------------------------
 
-    def _analyze_risk(self, data: bytes) -> Dict:
+    def _analyze_risk(self, data: bytes, strings: List[str]) -> Dict:
+        string_blob = '\n'.join(strings).lower()
+        lower_data = data.lower()
+
+        def has_token(*tokens: str) -> bool:
+            for token in tokens:
+                token_bytes = token.encode('ascii', errors='ignore').lower()
+                if token_bytes in lower_data or token.lower() in string_blob:
+                    return True
+            return False
+
         r: Dict = {
-            'has_stop_loss': b'StopLoss' in data or b'stoploss' in data.lower(),
-            'has_take_profit': b'TakeProfit' in data or b'takeprofit' in data.lower(),
-            'has_trailing_stop': b'TrailingStop' in data,
-            'has_money_management': b'MoneyManagement' in data or b'MM' in data,
-            'has_risk_percent': b'RiskPercent' in data or b'Risk' in data,
-            'has_max_lots': b'MaxLots' in data or b'MaxLot' in data,
-            'has_max_orders': b'MaxOrders' in data or b'MaxTrades' in data,
+            'has_stop_loss': has_token('StopLoss'),
+            'has_take_profit': has_token('TakeProfit'),
+            'has_trailing_stop': has_token('TrailingStop'),
+            'has_money_management': has_token('MoneyManagement', 'MM'),
+            'has_risk_percent': has_token('RiskPercent', 'Risk'),
+            'has_max_lots': has_token('MaxLots', 'MaxLot'),
+            'has_max_orders': has_token('MaxOrders', 'MaxTrades'),
+            'has_account_locking': has_token('AccountNumber', 'AccountServer',
+                                             'AccountCompany'),
+            'has_backtest_detection': has_token('IsTesting',
+                                                'TesterStatistics'),
+            'has_time_gating': has_token('TimeCurrent', 'TimeLocal', 'TimeGMT',
+                                         'DayOfWeek', 'Hour'),
             'features': [],
         }
         label_map = {
@@ -698,11 +838,77 @@ class EX4AnalysisEngine:
             'has_risk_percent': 'Risk Percentage Based',
             'has_max_lots': 'Maximum Lot Size Limit',
             'has_max_orders': 'Maximum Order Limit',
+            'has_account_locking': 'Account/Broker Locking Logic',
+            'has_backtest_detection': 'Backtest/Tester Detection',
+            'has_time_gating': 'Time-Based Enable/Disable Logic',
         }
         for k, lbl in label_map.items():
             if r.get(k):
                 r['features'].append(lbl)
         return r
+
+    def _audit_binary(self, data: bytes, strings: List[str]) -> Dict:
+        blob = '\n'.join(strings)
+        lower_blob = blob.lower()
+        lower_data = data.lower()
+        findings = []
+
+        def evidence_for(keywords: List[str]) -> List[str]:
+            evidence = []
+            for keyword in keywords:
+                token = keyword.lower()
+                if token.encode('ascii', errors='ignore') in lower_data or token in lower_blob:
+                    evidence.append(keyword)
+            return evidence
+
+        severity_map = {
+            'credential_access': 'critical',
+            'network_io': 'medium',
+            'dll_usage': 'medium',
+            'account_locking': 'medium',
+            'account_fingerprinting': 'medium',
+            'backtest_detection': 'medium',
+            'time_gating': 'low',
+        }
+        title_map = {
+            'credential_access': 'Credential access surfaces',
+            'network_io': 'Network or remote communication hooks',
+            'dll_usage': 'DLL or native import usage',
+            'account_locking': 'Account or broker locking hooks',
+            'account_fingerprinting': 'Account fingerprinting hooks',
+            'backtest_detection': 'Backtest or tester detection',
+            'time_gating': 'Time-based logic gates',
+        }
+
+        for category, keywords in AUDIT_KEYWORDS.items():
+            evidence = evidence_for(keywords)
+            if evidence:
+                findings.append({
+                    'severity': severity_map[category],
+                    'title': title_map[category],
+                    'evidence': evidence,
+                })
+
+        links = []
+        for value in strings:
+            if re.search(r'https?://|www\.|t\.me/', value, re.IGNORECASE):
+                links.append(value)
+        if links:
+            findings.append({
+                'severity': 'info',
+                'title': 'Embedded external links',
+                'evidence': links[:5],
+            })
+
+        severity_order = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1, 'info': 0}
+        overall = 'none'
+        if findings:
+            overall = max(findings, key=lambda item: severity_order[item['severity']])['severity']
+
+        return {
+            'severity': overall,
+            'findings': findings,
+        }
 
     # -- disassembly ----------------------------------------------------------
 
@@ -743,13 +949,17 @@ class EX4AnalysisEngine:
 
     # -- statistics -----------------------------------------------------------
 
-    def _statistics(self, data: bytes, strings: List[str]) -> Dict:
+    def _statistics(self, data: bytes, strings: List[str],
+                    string_sources: Dict[str, List[str]]) -> Dict:
         entropy = 0.0
         if data:
             counts = Counter(data)
             total = len(data)
             entropy = -sum(
                 (c / total) * math.log2(c / total) for c in counts.values())
+        source_counts = {
+            source: len(values) for source, values in string_sources.items()
+        }
         return {
             'file_size_bytes': len(data),
             'file_size_kb': round(len(data) / 1024, 2),
@@ -757,6 +967,71 @@ class EX4AnalysisEngine:
             'unique_strings': len(set(strings)),
             'has_mz_header': data[:2] == b'MZ',
             'entropy': round(entropy, 4),
+            'string_source_counts': source_counts,
+        }
+
+    def _build_recovery_profile(self, analysis: Dict) -> Dict:
+        meta = analysis.get('metadata', {})
+        stats = analysis.get('statistics', {})
+        strings = analysis.get('strings', [])
+        categories = analysis.get('string_categories', {})
+        source_counts = stats.get('string_source_counts', {})
+        structured_count = sum(
+            count for source, count in source_counts.items()
+            if source != 'fallback_scan'
+        )
+        meaningful_count = sum(
+            len(categories.get(name, []))
+            for name in ['functions', 'indicators', 'parameters',
+                         'links', 'metadata', 'security']
+        )
+        semantic_ratio = round(
+            meaningful_count / len(strings), 4) if strings else 0.0
+
+        score = 0
+        if meta.get('format', '').startswith('Modern'):
+            score += 2
+        if stats.get('entropy', 0) >= 7.2:
+            score += 2
+        if semantic_ratio < 0.08:
+            score += 1
+        if structured_count == 0:
+            score += 1
+        if not analysis.get('patterns'):
+            score += 1
+
+        if score >= 5:
+            obfuscation = 'High'
+        elif score >= 3:
+            obfuscation = 'Medium'
+        else:
+            obfuscation = 'Low'
+
+        if meta.get('format', '').startswith('Legacy') and analysis.get('input_parameters'):
+            recovery = 'Structured partial recovery'
+            confidence = 'Medium'
+        elif structured_count or analysis.get('audit_report', {}).get('findings'):
+            recovery = 'Metadata-oriented recovery'
+            confidence = 'Low'
+        else:
+            recovery = 'Minimal recoverable semantics'
+            confidence = 'Low'
+
+        notes = [
+            'Recovered metadata/parameters are grounded in preserved EX4 strings or tables.',
+            'Generated code remains a reconstruction template, not exact source recovery.',
+        ]
+        if meta.get('format', '').startswith('Modern'):
+            notes.append(
+                'Modern encrypted EX4 payloads preserve little high-confidence logic without opcode-level decoding.')
+
+        return {
+            'recovery_level': recovery,
+            'confidence': confidence,
+            'obfuscation_level': obfuscation,
+            'semantic_string_ratio': semantic_ratio,
+            'structured_strings': structured_count,
+            'notes': notes,
         }
 
 
@@ -800,6 +1075,7 @@ class CodeGenerator:
     def _mql4(self, a: Dict) -> str:
         L = []
         meta = a['metadata']
+        recovery = a.get('recovery_profile', {})
         L += self._header_box(f"Decompiled MQL4 \u2013 {meta['type']}")
         L.append(f"// Version:   {meta['version']}")
         L.append(f"// Format:    {meta.get('format', 'Unknown')}")
@@ -809,6 +1085,9 @@ class CodeGenerator:
             L.append(f"// Created:   {meta['creation_date']}")
         if meta.get('copyright', 'Unknown') != 'Unknown':
             L.append(f"// Copyright: {meta['copyright']}")
+        L.append(f"// Recovery:  {recovery.get('recovery_level', 'Unknown')}")
+        L.append("// Note: declarations are inferred from preserved EX4 data;")
+        L.append("//       function bodies below are reconstruction templates.")
         L.append('')
 
         strat = a.get('trading_strategy', {})
@@ -902,8 +1181,12 @@ class CodeGenerator:
         L = []
         meta = a['metadata']
         cn = self._safe_class_name(a)
+        recovery = a.get('recovery_profile', {})
         L += self._header_box(f"Decompiled MQL5 – {meta['type']}")
         L.append(f"// Version: {meta['version']}")
+        L.append(f"// Recovery: {recovery.get('recovery_level', 'Unknown')}")
+        L.append("// Note: preserved metadata/parameters are higher confidence")
+        L.append("//       than the reconstructed logic below.")
         L.append('')
         L.append('#include <Trade/Trade.mqh>')
         L.append('#include <Indicators/Indicators.mqh>')
@@ -978,10 +1261,14 @@ class CodeGenerator:
         L = []
         meta = a['metadata']
         cn = self._safe_class_name(a, 'TradingStrategy')
+        recovery = a.get('recovery_profile', {})
 
         L.append('"""')
         L.append(f"Converted from MT4 {meta['type']}")
         L.append(f"Version: {meta['version']}")
+        L.append(f"Recovery: {recovery.get('recovery_level', 'Unknown')}")
+        L.append("Recovered declarations come from preserved EX4 metadata/strings.")
+        L.append("Method bodies remain reconstructed templates.")
         strat = a.get('trading_strategy', {})
         if strat.get('type', 'Unknown') != 'Unknown':
             L.append(f"Strategy: {strat['type']}")
@@ -1068,8 +1355,11 @@ class CodeGenerator:
     def _c(self, a: Dict) -> str:
         L = []
         meta = a['metadata']
+        recovery = a.get('recovery_profile', {})
         L.append(f'/* Converted from MT4 {meta["type"]} */')
         L.append(f'/* Version: {meta["version"]} */')
+        L.append(f'/* Recovery: {recovery.get("recovery_level", "Unknown")} */')
+        L.append('/* Recovered declarations are higher confidence than body logic. */')
         L.append('')
         L.append('#include <stdio.h>')
         L.append('#include <stdlib.h>')
@@ -1126,8 +1416,11 @@ class CodeGenerator:
         L = []
         meta = a['metadata']
         cn = self._safe_class_name(a, 'trading_strategy')
+        recovery = a.get('recovery_profile', {})
         L.append(f'# Converted from MT4 {meta["type"]}')
         L.append(f'# Version: {meta["version"]}')
+        L.append(f'# Recovery: {recovery.get("recovery_level", "Unknown")}')
+        L.append('# Declarations are inferred; execution flow is reconstructed.')
         L.append('')
         L.append('library(quantmod)')
         L.append('library(TTR)')
@@ -1161,6 +1454,8 @@ class CodeGenerator:
         strat = a.get('trading_strategy', {})
         risk = a.get('risk_management', {})
         stats = a.get('statistics', {})
+        recovery = a.get('recovery_profile', {})
+        audit = a.get('audit_report', {})
 
         L.append('=' * W)
         L.append('EX4 FILE ANALYSIS REPORT'.center(W))
@@ -1185,6 +1480,18 @@ class CodeGenerator:
         L.append(f"  Size:          {stats.get('file_size_kb', 0)} KB")
         L.append(f"  Entropy:       {stats.get('entropy', 0)}")
         L.append('')
+
+        if recovery:
+            L.append('RECOVERY PROFILE')
+            L.append('-' * W)
+            L.append(f"  Level:         {recovery.get('recovery_level', 'Unknown')}")
+            L.append(f"  Confidence:    {recovery.get('confidence', 'Unknown')}")
+            L.append(f"  Obfuscation:   {recovery.get('obfuscation_level', 'Unknown')}")
+            L.append(f"  Structured:    {recovery.get('structured_strings', 0)} strings")
+            L.append(f"  Semantic ratio:{recovery.get('semantic_string_ratio', 0)}")
+            for note in recovery.get('notes', []):
+                L.append(f"  - {note}")
+            L.append('')
 
         pe = a.get('pe_info', {})
         if pe.get('valid_pe'):
@@ -1216,6 +1523,15 @@ class CodeGenerator:
             L.append('-' * W)
             for f in risk['features']:
                 L.append(f"  \u2713 {f}")
+            L.append('')
+
+        if audit.get('findings'):
+            L.append('AUDIT FINDINGS')
+            L.append('-' * W)
+            for finding in audit['findings']:
+                L.append(
+                    f"  [{finding['severity'].upper()}] {finding['title']}: "
+                    f"{', '.join(finding['evidence'])}")
             L.append('')
 
         handlers = a.get('event_handlers', [])
@@ -1783,6 +2099,8 @@ class EX4StudioApp(ctk.CTk):
         strat = a.get('trading_strategy', {})
         risk = a.get('risk_management', {})
         stats = a.get('statistics', {})
+        recovery = a.get('recovery_profile', {})
+        audit = a.get('audit_report', {})
 
         lines = []
         lines.append(f"{'═' * 60}")
@@ -1803,6 +2121,19 @@ class EX4StudioApp(ctk.CTk):
         if meta.get('link', 'Unknown') != 'Unknown':
             lines.append(f"  Link:         {meta['link']}")
         lines.append("")
+
+        if recovery:
+            lines.append("  RECOVERY PROFILE")
+            lines.append(
+                f"  ├─ Level:      {recovery.get('recovery_level', 'Unknown')}")
+            lines.append(
+                f"  ├─ Confidence: {recovery.get('confidence', 'Unknown')}")
+            lines.append(
+                f"  ├─ Obfuscation:{recovery.get('obfuscation_level', 'Unknown')}")
+            lines.append(
+                f"  └─ Structured: {recovery.get('structured_strings', 0)} "
+                f"strings @ {recovery.get('semantic_string_ratio', 0)} ratio")
+            lines.append("")
 
         if pe.get('valid_pe'):
             lines.append("  PE HEADER")
@@ -1830,6 +2161,14 @@ class EX4StudioApp(ctk.CTk):
             for i, f in enumerate(risk['features']):
                 prefix = "  └─" if i == len(risk['features']) - 1 else "  ├─"
                 lines.append(f"{prefix} {f}")
+            lines.append("")
+
+        if audit.get('findings'):
+            lines.append(f"  AUDIT: {audit.get('severity', 'none').upper()}")
+            for finding in audit['findings']:
+                lines.append(
+                    f"  • [{finding['severity']}] {finding['title']} -> "
+                    f"{', '.join(finding['evidence'])}")
             lines.append("")
 
         handlers = a.get('event_handlers', [])
@@ -1913,7 +2252,7 @@ class EX4StudioApp(ctk.CTk):
                     lines.append(f"    {ins}")
                 lines.append("")
         else:
-            if 'encrypted' in meta.get('format', '').lower():
+            if meta.get('format', '').startswith('Modern'):
                 lines.append("  [i] Content is encrypted (modern EX4 format)")
                 lines.append("      x86 function prologues not directly visible")
                 lines.append("      String extraction and pattern analysis used instead")
